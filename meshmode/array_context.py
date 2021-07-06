@@ -31,6 +31,7 @@ from arraycontext import PytatoPyOpenCLArrayContext as PytatoPyOpenCLArrayContex
 from arraycontext.pytest import (
         _PytestPyOpenCLArrayContextFactoryWithClass,
         register_pytest_array_context_factory)
+from loopy.translation_unit import for_each_kernel
 
 
 def thaw(actx, ary):
@@ -308,5 +309,90 @@ class PytatoPyOpenCLArrayContext(PytatoPyOpenCLArrayContextBase):
     def transform_loopy_program(self, t_unit):
         # FIXME: Do not parallelize for now.
         return t_unit
+
+
+@for_each_kernel
+def _single_grid_work_group_transform(kernel, cl_device):
+    import loopy as lp
+    from meshmode.transform_metadata import (ConcurrentElementInameTag,
+                                             ConcurrentDOFInameTag)
+
+    ngroups = cl_device.max_compute_units * 4  # '4' to overfill the device
+    l_one_size = 16
+    l_zero_size = 2
+
+    for insn in kernel.instructions:
+        if isinstance(insn, lp.CallInstruction):
+            # must be a callable kernel, don't touch.
+            pass
+        elif isinstance(insn, lp.Assignment):
+            bigger_loop = None
+            smaller_loop = None
+
+            if len(insn.within_inames) == 0:
+                continue
+
+            if len(insn.within_inames) == 1:
+                iname, = insn.within_inames
+
+                kernel = lp.split_iname(kernel, iname,
+                                        ngroups * l_zero_size * l_one_size)
+                kernel = lp.split_iname(kernel, f"{iname}_inner",
+                                        l_zero_size, inner_tag="l.0")
+                kernel = lp.split_iname(kernel, f"{iname}_inner_outer",
+                                        l_one_size, inner_tag="l.1",
+                                        outer_tag="g.0")
+                continue
+
+            for iname in insn.within_inames:
+                if kernel.iname_tags_of_type(iname,
+                                             ConcurrentElementInameTag):
+                    assert bigger_loop is None
+                    bigger_loop = iname
+                elif kernel.iname_tags_of_type(iname,
+                                               ConcurrentDOFInameTag):
+                    assert smaller_loop is None
+                    smaller_loop = iname
+                else:
+                    pass
+
+            if bigger_loop or smaller_loop:
+                assert (bigger_loop is not None
+                        and smaller_loop is not None)
+            else:
+                sorted_inames = sorted(tuple(insn.within_inames),
+                                       key=kernel.get_constant_iname_length)
+                smaller_loop = sorted_inames[0]
+                bigger_loop = sorted_inames[-1]
+
+            # kernel = lp.chunk_iname(kernel, bigger_loop, ngroups,
+            #                         outer_tag="g.0")
+            # kernel = lp.split_iname(kernel, f"{bigger_loop}_inner",
+            #                         l_one_size, inner_tag="l.1")
+            kernel = lp.split_iname(kernel, f"{bigger_loop}",
+                                    l_one_size * ngroups)
+            kernel = lp.split_iname(kernel, f"{bigger_loop}_inner",
+                                    l_one_size, inner_tag="l.1", outer_tag="g.0")
+            kernel = lp.split_iname(kernel, smaller_loop,
+                                    l_zero_size, inner_tag="l.0")
+        elif isinstance(insn, lp.BarrierInstruction):
+            pass
+        else:
+            raise NotImplementedError
+
+    return kernel
+
+
+class SingleGridWorkBalancingPytatoArrayContext(PytatoPyOpenCLArrayContextBase):
+    """
+    A :class:`PytatoPyOpenCLArrayContext` that parallelizes work in an OpenCL
+    kernel so that the work
+    """
+    def transform_loopy_program(self, t_unit):
+        import loopy as lp
+        t_unit = _single_grid_work_group_transform(t_unit, self.queue.device)
+        t_unit = lp.set_options(t_unit, "insert_gbarriers")
+        return t_unit
+
 
 # vim: foldmethod=marker
