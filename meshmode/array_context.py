@@ -383,6 +383,93 @@ def _single_grid_work_group_transform(kernel, cl_device):
     return kernel
 
 
+def _alias_global_temporaries(t_unit):
+    """
+    Returns a copy of *t_unit* with temporaries of that have disjoint live
+    intervals using the same :attr:`loopy.TemporaryVariable.base_storage`.
+    """
+    from loopy.kernel.data import AddressSpace
+    from loopy.kernel import KernelState
+    from loopy.schedule import (RunInstruction, EnterLoop, LeaveLoop,
+                                CallKernel, ReturnFromKernel, Barrier)
+    from loopy.schedule.tools import get_nearest_return_from_kernel
+    from pytools import UniqueNameGenerator
+    from collections import defaultdict
+
+    kernel = t_unit.default_entrypoint
+    assert kernel.state == KernelState.LINEARIZED
+    temp_vars = frozenset(tv.name
+                          for tv in kernel.temporary_variables.values()
+                          if tv.address_space == AddressSpace.GLOBAL)
+    temp_to_live_interval_start = {}
+    temp_to_live_interval_end = {}
+    return_from_kernel_idxs = get_nearest_return_from_kernel(kernel)
+
+    for sched_idx, sched_item in enumerate(kernel.linearization):
+        if isinstance(sched_item, RunInstruction):
+            for var in (kernel.id_to_insn[sched_item.insn_id].dependency_names()
+                        & temp_vars):
+                if var not in temp_to_live_interval_start:
+                    assert var not in temp_to_live_interval_end
+                    temp_to_live_interval_start[var] = sched_idx
+                assert var in temp_to_live_interval_start
+                temp_to_live_interval_end[var] = return_from_kernel_idxs[sched_idx]
+        elif isinstance(sched_item, (EnterLoop, LeaveLoop, CallKernel,
+                                     ReturnFromKernel, Barrier)):
+            # no variables are accessed within these schedule items => do
+            # nothing.
+            pass
+        else:
+            raise NotImplementedError(type(sched_item))
+
+    vng = UniqueNameGenerator()
+    # a mapping from shape to the available base storages from temp variables
+    # that were dead.
+    shape_to_available_base_storage = defaultdict(set)
+
+    sched_idx_to_just_live_temp_vars = [set() for _ in kernel.linearization]
+    sched_idx_to_just_dead_temp_vars = [set() for _ in kernel.linearization]
+
+    for tv, just_alive_idx in temp_to_live_interval_start.items():
+        sched_idx_to_just_live_temp_vars[just_alive_idx].add(tv)
+
+    for tv, just_dead_idx in temp_to_live_interval_end.items():
+        sched_idx_to_just_dead_temp_vars[just_dead_idx].add(tv)
+
+    new_tvs = {}
+
+    for sched_idx, _ in enumerate(kernel.linearization):
+        just_dead_temps = sched_idx_to_just_dead_temp_vars[sched_idx]
+        to_be_allocated_temps = sched_idx_to_just_live_temp_vars[sched_idx]
+        for tv_name in just_dead_temps:
+            tv = new_tvs[tv_name]
+            assert tv.base_storage is not None
+            assert tv.base_storage not in shape_to_available_base_storage[tv.nbytes]
+            shape_to_available_base_storage[tv.nbytes].add(tv.base_storage)
+
+        for tv_name in to_be_allocated_temps:
+            assert len(to_be_allocated_temps) <= 1
+            tv = kernel.temporary_variables[tv_name]
+            assert tv.name not in new_tvs
+            assert tv.base_storage is None
+            if shape_to_available_base_storage[tv.nbytes]:
+                base_storage = shape_to_available_base_storage[tv.nbytes].pop()
+            else:
+                base_storage = vng("_msh_actx_tmp_base")
+
+            new_tvs[tv.name] = tv.copy(base_storage=base_storage)
+
+    for name, tv in kernel.temporary_variables.items():
+        if tv.address_space != AddressSpace.GLOBAL:
+            new_tvs[name] = tv
+        else:
+            assert name in new_tvs
+
+    kernel = kernel.copy(temporary_variables=new_tvs)
+
+    return t_unit.with_kernel(kernel)
+
+
 class SingleGridWorkBalancingPytatoArrayContext(PytatoPyOpenCLArrayContextBase):
     """
     A :class:`PytatoPyOpenCLArrayContext` that parallelizes work in an OpenCL
@@ -392,6 +479,9 @@ class SingleGridWorkBalancingPytatoArrayContext(PytatoPyOpenCLArrayContextBase):
         import loopy as lp
         t_unit = _single_grid_work_group_transform(t_unit, self.queue.device)
         t_unit = lp.set_options(t_unit, "insert_gbarriers")
+        t_unit = lp.linearize(lp.preprocess_kernel(t_unit))
+        t_unit = _alias_global_temporaries(t_unit)
+
         return t_unit
 
 
